@@ -1,0 +1,13 @@
+{
+  "name": "com.behknqux.posepicker",
+  "version": "1.0.0",
+  "displayName": "Pose Picker",
+  "description": "Pick a frame of an animation clip, adjust body and bones (rotation gizmos, editor-only two-bone IK), shape the blend into it, save named poses and apply them to Animator states. At runtime ModelPose plays the pose on top of the Animator.",
+  "unity": "6000.0",
+  "author": {
+    "name": "BehknQux",
+    "url": "https://github.com/BehknQux"
+  },
+  "license": "MIT",
+  "keywords": ["animation", "pose", "humanoid", "animator", "editor"]
+}
