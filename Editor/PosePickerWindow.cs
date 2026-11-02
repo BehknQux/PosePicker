@@ -606,7 +606,7 @@ namespace PosePicker.Editor
                 GUI.enabled = true;
             }
             if (_model == null)
-                EditorGUILayout.HelpBox("Pick a model to preview.",MessageType.Info);
+                EditorGUILayout.HelpBox("Pick a model to preview.", MessageType.Info);
         }
 
         private static float FrameSlider(string label, AnimationClip clip, float time)
