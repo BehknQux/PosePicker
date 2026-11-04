@@ -16,6 +16,11 @@ namespace PosePicker.Editor
     ///   bones, click one for a rotation gizmo. IK mode: drag a hand or foot and the arm or leg follows
     ///   (two-bone IK), shoulder or hip staying put; a small ball sets the elbow or knee side. IK only
     ///   helps editing: the result is stored as bone turns.
+    /// - Mask: which bones take the pose (Unreal's Layered blend per bone): branches, each a bone and
+    ///   everything under it, with a fade-in depth and an exclude switch. No branch: the whole body,
+    ///   held by an Animator state. With branches the pose is layered: code plays it with
+    ///   ModelPose.PlayLayered, the rest of the body keeps whatever the Animator plays. The preview
+    ///   plays an animation underneath (e.g. a run) with the pose held on top, or blending in and out.
     /// - Aim: whether the pose leans to an action's aim (ModelPose.Lean), with a sample aim angle shown as
     ///   a draggable arrow.
     /// - Blend: how the body moves into the pose (time and a hand-drawn curve, with presets). The preview
@@ -83,6 +88,8 @@ namespace PosePicker.Editor
         [SerializeField] private float _blendIn = 0.1f;
         [SerializeField] private AnimationCurve _blendShape = AnimationCurve.Linear(0f, 0f, 1f, 1f);
         [SerializeField] private Mode _mode;
+        [SerializeField] private BoneMask _mask = new();
+        [SerializeField] private float _blendOut = 0.2f;
         private HumanBodyBones _selected = HumanBodyBones.LastBone;
 
         // Preview-only settings: a sample aim, and what plays before the blend.
@@ -102,12 +109,22 @@ namespace PosePicker.Editor
         private double _lastTick;
         private const float Hold = 0.4f;
 
+        // Layered preview: an animation playing underneath, the pose held on it or blending in and out.
+        private enum LayerPreview { Off, Hold, Blend }
+        private LayerPreview _layerPreview;
+        private AnimationClip _baseClip;
+        private PlayableGraph _baseGraph;
+        private AnimationClip _baseGraphClip;
+        private float _baseTime;
+        private double _baseTick;
+        private const float LayerRest = 0.6f, LayerHold = 1f;
+
         // Library.
         private string _poseName = "NewPose";
         private PoseAsset _loadPose;
 
         // Foldouts.
-        [SerializeField] private bool _foldSource = true, _foldPose = true, _foldAim = true, _foldBlend = true, _foldLibrary = true;
+        [SerializeField] private bool _foldSource = true, _foldPose = true, _foldMask = true, _foldAim = true, _foldBlend = true, _foldLibrary = true;
 
         private readonly List<AnimatorState> _states = new();
         private readonly List<string> _stateNames = new();
@@ -159,9 +176,19 @@ namespace PosePicker.Editor
             Repaint();
         }
 
-        // Plays the blend preview once, over the blend time.
+        // Plays the blend preview once, over the blend time; the layered preview keeps looping.
         private void Tick()
         {
+            if (_layerPreview != LayerPreview.Off)
+            {
+                double clock = EditorApplication.timeSinceStartup;
+                _baseTime += (float)(clock - _baseTick);
+                _baseTick = clock;
+                if (IsPreviewing)
+                    Sample();
+                Repaint();
+                return;
+            }
             if (!_playing)
                 return;
             double now = EditorApplication.timeSinceStartup;
@@ -191,6 +218,7 @@ namespace PosePicker.Editor
             float normalized = _clip.length > 0f ? _time / _clip.length : 0f;
 
             DrawPoseSection();
+            DrawMaskSection();
             DrawAimSection();
             if (EditorGUI.EndChangeCheck())
                 ShowPose();
@@ -278,6 +306,7 @@ namespace PosePicker.Editor
             _foldPose = EditorGUILayout.BeginFoldoutHeaderGroup(_foldPose, "2. Pose");
             if (_foldPose)
             {
+                GUI.enabled = !Layered;
                 EditorGUI.BeginChangeCheck();
                 Vector3 rotation = EditorGUILayout.Vector3Field(new GUIContent("Body rotation (degrees)",
                     "The whole body turns around the hips. X: pitch (head down), Y: turn left / right, Z: roll to the side."), _rotation);
@@ -286,6 +315,9 @@ namespace PosePicker.Editor
                     Undo.RecordObject(this, "Pose Picker: body rotation");
                     _rotation = rotation;
                 }
+                GUI.enabled = true;
+                if (Layered)
+                    EditorGUILayout.LabelField(" ", "Body rotation is for whole-body poses; a layered pose turns only its bones.", EditorStyles.wordWrappedMiniLabel);
 
                 EditorGUI.BeginChangeCheck();
                 _mode = (Mode)GUILayout.Toolbar((int)_mode, new[] { "Rotate", "IK (hand / foot)" });
@@ -343,7 +375,9 @@ namespace PosePicker.Editor
         private void DrawAimSection()
         {
             _foldAim = EditorGUILayout.BeginFoldoutHeaderGroup(_foldAim, "3. Aim");
-            if (_foldAim)
+            if (_foldAim && Layered)
+                EditorGUILayout.LabelField(" ", "Aim is for whole-body poses.", EditorStyles.miniLabel);
+            else if (_foldAim)
             {
                 EditorGUI.BeginChangeCheck();
                 bool follow = EditorGUILayout.Toggle(new GUIContent("Follow aim",
@@ -402,6 +436,21 @@ namespace PosePicker.Editor
                         SetShape(new AnimationCurve(new Keyframe(0f, 0f, 0f, 0f), new Keyframe(1f, 1f, 2f, 2f)));
                     if (GUILayout.Button("Overshoot", EditorStyles.miniButtonRight))
                         SetShape(new AnimationCurve(new Keyframe(0f, 0f, 0f, 3f), new Keyframe(0.6f, 1.15f, 0f, 0f), new Keyframe(1f, 1f, 0f, 0f)));
+                }
+
+                if (Layered)
+                {
+                    EditorGUI.BeginChangeCheck();
+                    float blendOut = EditorGUILayout.FloatField(new GUIContent("Out (s)",
+                        "How long the bones take to go back to the animation underneath when the pose stops."), _blendOut);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(this, "Pose Picker: blend out");
+                        _blendOut = Mathf.Max(0f, blendOut);
+                    }
+                    EditorGUILayout.LabelField(" ", "See it with the animation underneath: Mask section, Play blend.", EditorStyles.miniLabel);
+                    EditorGUILayout.EndFoldoutHeaderGroup();
+                    return;
                 }
 
                 EditorGUILayout.Space(4);
@@ -600,11 +649,14 @@ namespace PosePicker.Editor
                     else
                         StartPreview();
                 }
-                GUI.enabled = state != null && _clip != null;
+                GUI.enabled = state != null && _clip != null && !Layered;
                 if (GUILayout.Button(state != null ? $"Apply pose to {state.name}" : "Apply pose to state", GUILayout.Height(24)))
                     Apply(state, normalized);
                 GUI.enabled = true;
             }
+            if (Layered)
+                EditorGUILayout.HelpBox("A layered pose is not put on a state: save it in the Library, and code plays it with " +
+                                        "ModelPose.PlayLayered(pose).", MessageType.None);
             if (_model == null)
                 EditorGUILayout.HelpBox("Pick a model to preview.", MessageType.Info);
         }
@@ -666,6 +718,14 @@ namespace PosePicker.Editor
             pose.FollowAim = _followAim;
             pose.BlendIn = _blendIn;
             pose.BlendShape = new AnimationCurve(_blendShape.keys);
+            pose.Mask = _mask.Copy();
+            pose.BlendOut = _blendOut;
+            List<PoseAsset.BoneRotation> rotations = BakeRotations();
+            if (rotations != null)
+                pose.Rotations = rotations;
+            else
+                Debug.LogWarning("Pose Picker: no humanoid model to read the pose's bones from; pick a model and save again " +
+                                 "before playing it as a layered pose.");
             EditorUtility.SetDirty(pose);
             AssetDatabase.SaveAssets();
             _loadPose = pose;
@@ -683,6 +743,8 @@ namespace PosePicker.Editor
             _followAim = pose.FollowAim;
             _blendIn = pose.BlendIn;
             _blendShape = pose.BlendShape != null ? new AnimationCurve(pose.BlendShape.keys) : AnimationCurve.Linear(0f, 0f, 1f, 1f);
+            _mask = pose.Mask != null ? pose.Mask.Copy() : new BoneMask();
+            _blendOut = pose.BlendOut;
             _poseName = pose.name;
             _poles.Clear();
             _selected = HumanBodyBones.LastBone;
@@ -698,7 +760,14 @@ namespace PosePicker.Editor
             if (_followAim)
                 DrawAimArrow();
 
-            // Bones are edited on the finished pose; mid-blend the body is somewhere in between.
+            // Bones are edited on the finished pose; mid-blend or over an animation the body is somewhere in between.
+            if (_layerPreview != LayerPreview.Off)
+            {
+                Handles.BeginGUI();
+                GUI.Label(new Rect(10, 10, 360, 20), "Animation playing underneath: stop it to edit bones.");
+                Handles.EndGUI();
+                return;
+            }
             if (BlendVisible)
             {
                 Handles.BeginGUI();
@@ -707,6 +776,7 @@ namespace PosePicker.Editor
                 return;
             }
 
+            float[] maskWeights = Layered ? _mask.Weights(_previewAnimator) : null;
             foreach (HumanBodyBones id in _mode == Mode.IK ? LimbEnds() : EditableBones)
             {
                 Transform bone = _previewAnimator.GetBoneTransform(id);
@@ -715,6 +785,9 @@ namespace PosePicker.Editor
                 float size = HandleUtility.GetHandleSize(bone.position) * 0.05f;
                 Handles.color = id == _selected ? Color.yellow
                     : _mode == Mode.IK ? new Color(1f, 0.5f, 0.3f) : new Color(0.3f, 0.9f, 0.7f);
+                // Layered: bones outside the mask grey, partly masked ones in between.
+                if (maskWeights != null && id != _selected)
+                    Handles.color = Color.Lerp(new Color(0.45f, 0.45f, 0.45f), Handles.color, maskWeights[(int)id]);
                 if (Handles.Button(bone.position, Quaternion.identity, size, size * 1.3f, Handles.SphereHandleCap))
                 {
                     _selected = id;
@@ -929,6 +1002,7 @@ namespace PosePicker.Editor
             _blendIn = saved != null ? saved.BlendIn : 0.1f;
             _blendShape = saved != null && saved.BlendShape != null && saved.BlendShape.length > 0
                 ? new AnimationCurve(saved.BlendShape.keys) : AnimationCurve.Linear(0f, 0f, 1f, 1f);
+            _mask = new BoneMask();
             _poles.Clear();
             _selected = HumanBodyBones.LastBone;
         }
@@ -1123,6 +1197,10 @@ namespace PosePicker.Editor
         private void StopPreview()
         {
             _playing = false;
+            _layerPreview = LayerPreview.Off;
+            if (_baseGraph.IsValid())
+                _baseGraph.Destroy();
+            _baseGraphClip = null;
             if (_graph.IsValid())
                 _graph.Destroy();
             if (_fromGraph.IsValid())
@@ -1174,6 +1252,11 @@ namespace PosePicker.Editor
             KeepPreviewAlive();
             if (_clip == null || !IsPreviewing || !AnimationMode.InAnimationMode())
                 return;
+            if (Layered)
+            {
+                SampleLayered();
+                return;
+            }
             bool blend = BlendVisible;
             float weight = 1f;
             if (blend)
@@ -1197,6 +1280,234 @@ namespace PosePicker.Editor
                 weight = BlendShapes.Evaluate(_blendShape, _blendIn > 0f ? (_timeline - lead) / _blendIn : 1f);
             }
 
+            SamplePose();
+            Quaternion rotation = Quaternion.Euler(_rotation);
+            if (_followAim)
+                rotation = Quaternion.Euler(_sampleAim, 0f, 0f) * rotation;
+            ModelPose.Apply(_previewModel, _previewHips, _previewBasePosition, _previewBaseRotation, rotation);
+
+            if (blend)
+                _previewSnapshot.BlendTo(weight);
+            SceneView.RepaintAll();
+        }
+
+        // --- Mask (layered by bone) -------------------------------------------------------------
+
+        /// <summary>The pose takes only some bones: played from code over the Animator, not held by a state.</summary>
+        private bool Layered => _mask != null && !_mask.IsWholeBody;
+
+        private static readonly string[] AllBoneNames = BuildBoneNames();
+
+        private static string[] BuildBoneNames()
+        {
+            var names = new string[(int)HumanBodyBones.LastBone];
+            for (int i = 0; i < names.Length; i++)
+                names[i] = ObjectNames.NicifyVariableName(((HumanBodyBones)i).ToString());
+            return names;
+        }
+
+        private void DrawMaskSection()
+        {
+            _foldMask = EditorGUILayout.BeginFoldoutHeaderGroup(_foldMask, "3. Mask (layered by bone)");
+            if (_foldMask)
+            {
+                EditorGUILayout.LabelField(Layered
+                        ? "Only these bones take the pose; the rest keeps whatever the Animator plays. Grey dots in the Scene view are outside the mask."
+                        : "Whole body. Add a branch and only that bone and everything under it take the pose (e.g. upper body over a run).",
+                    EditorStyles.wordWrappedMiniLabel);
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Whole body", EditorStyles.miniButtonLeft))
+                        SetMask();
+                    if (GUILayout.Button("Upper body", EditorStyles.miniButtonMid))
+                        SetMask(new BoneMask.Branch { Bone = HumanBodyBones.Spine, BlendDepth = 2 });
+                    if (GUILayout.Button("Arms", EditorStyles.miniButtonMid))
+                        SetMask(new BoneMask.Branch { Bone = HumanBodyBones.LeftShoulder },
+                            new BoneMask.Branch { Bone = HumanBodyBones.RightShoulder });
+                    if (GUILayout.Button("Head", EditorStyles.miniButtonRight))
+                        SetMask(new BoneMask.Branch { Bone = HumanBodyBones.Neck });
+                }
+
+                for (int i = 0; i < _mask.Branches.Count; i++)
+                {
+                    BoneMask.Branch branch = _mask.Branches[i];
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        EditorGUI.BeginChangeCheck();
+                        int bone = EditorGUILayout.Popup((int)branch.Bone, AllBoneNames);
+                        EditorGUIUtility.labelWidth = 40;
+                        int depth = EditorGUILayout.IntField(new GUIContent("Depth",
+                            "Bones down the branch over which the pose fades in. 0: full strength from this bone."), branch.BlendDepth, GUILayout.Width(80));
+                        EditorGUIUtility.labelWidth = 0;
+                        bool exclude = GUILayout.Toggle(branch.Exclude, new GUIContent("Exclude", "Takes this branch out of the pose."),
+                            EditorStyles.miniButton, GUILayout.Width(60));
+                        if (EditorGUI.EndChangeCheck())
+                        {
+                            Undo.RecordObject(this, "Pose Picker: mask branch");
+                            _mask.Branches[i] = new BoneMask.Branch { Bone = (HumanBodyBones)bone, BlendDepth = Mathf.Max(0, depth), Exclude = exclude };
+                        }
+                        if (GUILayout.Button("X", EditorStyles.miniButton, GUILayout.Width(22)))
+                        {
+                            Undo.RecordObject(this, "Pose Picker: remove branch");
+                            _mask.Branches.RemoveAt(i);
+                            GUIUtility.ExitGUI();
+                        }
+                    }
+                }
+
+                bool picked = _selected != HumanBodyBones.LastBone;
+                if (GUILayout.Button(picked ? $"Add branch at {BoneNames[_selected]}" : "Add branch (pick a bone dot to start it there)"))
+                {
+                    Undo.RecordObject(this, "Pose Picker: add branch");
+                    _mask.Branches.Add(new BoneMask.Branch { Bone = picked ? _selected : HumanBodyBones.Spine });
+                }
+
+                if (!Layered)
+                    _layerPreview = LayerPreview.Off;
+                else
+                {
+                    EditorGUILayout.Space(4);
+                    EditorGUILayout.LabelField("Preview: animation underneath", EditorStyles.miniBoldLabel);
+                    _baseClip = (AnimationClip)EditorGUILayout.ObjectField(new GUIContent("Clip",
+                        "Plays in a loop under the pose, as the Animator would in game (e.g. a run)."), _baseClip, typeof(AnimationClip), false);
+                    GUI.enabled = _baseClip != null && _model != null;
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Toggle(_layerPreview == LayerPreview.Hold, "Play with pose held", EditorStyles.miniButtonLeft)
+                            != (_layerPreview == LayerPreview.Hold))
+                            SetLayerPreview(_layerPreview == LayerPreview.Hold ? LayerPreview.Off : LayerPreview.Hold);
+                        if (GUILayout.Toggle(_layerPreview == LayerPreview.Blend, "Play blend in and out", EditorStyles.miniButtonRight)
+                            != (_layerPreview == LayerPreview.Blend))
+                            SetLayerPreview(_layerPreview == LayerPreview.Blend ? LayerPreview.Off : LayerPreview.Blend);
+                    }
+                    GUI.enabled = true;
+                    if (_layerPreview == LayerPreview.Blend)
+                        EditorGUILayout.LabelField(" ", LayerPhase(), EditorStyles.miniLabel);
+                }
+            }
+            EditorGUILayout.EndFoldoutHeaderGroup();
+        }
+
+        private void SetMask(params BoneMask.Branch[] branches)
+        {
+            Undo.RecordObject(this, "Pose Picker: mask");
+            _mask = new BoneMask { Branches = new List<BoneMask.Branch>(branches) };
+        }
+
+        private void SetLayerPreview(LayerPreview mode)
+        {
+            if (mode != LayerPreview.Off && !IsPreviewing)
+                StartPreview();
+            _layerPreview = IsPreviewing ? mode : LayerPreview.Off;
+            _baseTime = 0f;
+            _baseTick = EditorApplication.timeSinceStartup;
+            if (IsPreviewing)
+                Sample();
+        }
+
+        private float LayerCycle => LayerRest + _blendIn + LayerHold + _blendOut + LayerRest;
+
+        /// <summary>
+        /// The pose's strength in the layered preview. Held: full. Blend: a loop of the animation alone, the
+        /// pose blending in along the curve, held, blending out, the animation alone again, as
+        /// ModelPose.PlayLayered and StopLayered do in game.
+        /// </summary>
+        private float LayerPreviewWeight()
+        {
+            if (_layerPreview == LayerPreview.Hold)
+                return 1f;
+            float t = Mathf.Repeat(_baseTime, LayerCycle) - LayerRest;
+            if (t < 0f)
+                return 0f;
+            if (t < _blendIn)
+                return BlendShapes.Evaluate(_blendShape, t / _blendIn);
+            t -= _blendIn;
+            if (t < LayerHold)
+                return 1f;
+            t -= LayerHold;
+            if (t < _blendOut)
+                return BlendShapes.FadeOut(t / _blendOut);
+            return 0f;
+        }
+
+        private string LayerPhase()
+        {
+            float t = Mathf.Repeat(_baseTime, LayerCycle) - LayerRest;
+            if (t < 0f)
+                return "Animation alone";
+            if (t < _blendIn)
+                return "Blending in";
+            if (t < _blendIn + LayerHold)
+                return "Pose held";
+            if (t < _blendIn + LayerHold + _blendOut)
+                return "Blending out";
+            return "Animation alone";
+        }
+
+        /// <summary>The picked frame with the bone turns on, as the bones' local rotations (whole body).</summary>
+        private Quaternion[] PosedRotations()
+        {
+            SamplePose();
+            var rotations = new Quaternion[(int)HumanBodyBones.LastBone];
+            for (int i = 0; i < rotations.Length; i++)
+            {
+                Transform bone = _previewAnimator.GetBoneTransform((HumanBodyBones)i);
+                rotations[i] = bone != null ? bone.localRotation : Quaternion.identity;
+            }
+            return rotations;
+        }
+
+        /// <summary>
+        /// For Save: every bone's local rotation in the finished pose, read on the preview model (a
+        /// short preview runs if none is on). Null without a humanoid model.
+        /// </summary>
+        private List<PoseAsset.BoneRotation> BakeRotations()
+        {
+            if (_model == null || _clip == null)
+                return null;
+            bool started = !IsPreviewing;
+            if (started)
+                StartPreview();
+            if (!IsPreviewing || !_previewAnimator.isHuman)
+            {
+                if (started)
+                    StopPreview();
+                return null;
+            }
+            KeepPreviewAlive();
+            Quaternion[] posed = PosedRotations();
+            var rotations = new List<PoseAsset.BoneRotation>();
+            for (int i = 0; i < posed.Length; i++)
+                if (_previewAnimator.GetBoneTransform((HumanBodyBones)i) != null)
+                    rotations.Add(new PoseAsset.BoneRotation { Bone = (HumanBodyBones)i, Rotation = posed[i] });
+            if (started)
+                StopPreview();
+            else
+                Sample();
+            return rotations;
+        }
+
+        /// <summary>
+        /// The layered preview, built the way ModelPose builds the game frame: the animation underneath on
+        /// the whole body, then the masked bones turned toward the pose by the mask times the pose's
+        /// strength. With nothing playing underneath it shows the pose alone, for editing.
+        /// </summary>
+        private void SampleLayered()
+        {
+            Quaternion[] posed = PosedRotations();
+            if (_layerPreview != LayerPreview.Off && _baseClip != null)
+            {
+                SampleClip(ref _baseGraph, ref _baseGraphClip, _baseClip, Mathf.Repeat(_baseTime, Mathf.Max(0.01f, _baseClip.length)));
+                new PoseLayer(_previewAnimator, _mask, posed).Apply(LayerPreviewWeight());
+            }
+            _previewModel.SetLocalPositionAndRotation(_previewBasePosition, _previewBaseRotation);
+            SceneView.RepaintAll();
+        }
+
+        /// <summary>The picked frame on the preview, its animated rotations kept (offsets are measured from them), bone turns on.</summary>
+        private void SamplePose()
+        {
             SampleClip(ref _graph, ref _graphClip, _clip, _time);
             _animatedLocal.Clear();
             if (_previewAnimator.isHuman)
@@ -1207,14 +1518,6 @@ namespace PosePicker.Editor
                         _animatedLocal[id] = bone.localRotation;
                 }
             ModelPose.ApplyBones(_previewAnimator, _bones);
-            Quaternion rotation = Quaternion.Euler(_rotation);
-            if (_followAim)
-                rotation = Quaternion.Euler(_sampleAim, 0f, 0f) * rotation;
-            ModelPose.Apply(_previewModel, _previewHips, _previewBasePosition, _previewBaseRotation, rotation);
-
-            if (blend)
-                _previewSnapshot.BlendTo(weight);
-            SceneView.RepaintAll();
         }
     }
 }

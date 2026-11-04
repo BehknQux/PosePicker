@@ -60,5 +60,8 @@ namespace PosePicker
             t = Mathf.Clamp01(t);
             return shape != null && shape.length > 0 ? shape.Evaluate(t) : t;
         }
+
+        /// <summary>Progress 0..1 in, what is left of the pose out: 1 down to 0, easing at both ends.</summary>
+        public static float FadeOut(float t) => 1f - Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(t));
     }
 }

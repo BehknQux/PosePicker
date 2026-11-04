@@ -14,6 +14,10 @@ namespace PosePicker
     /// live pose). Code entering such a state plays it at once (no Animator cross-fade on top).
     /// While something else owns the model (a ragdoll), disable this component: it writes nothing then,
     /// and disabling or enabling it drops the state and Lean, so the pose starts plain again.
+    /// Layered poses (a PoseAsset with a bone mask) are played from code with PlayLayered / StopLayered:
+    /// only the masked bones take the pose, the rest keeps what the Animator plays, so the legs can run
+    /// under a held upper body. They go on last, over the state's pose and blend. One plays at a time;
+    /// starting another fades the old one out underneath while the new one fades in.
     /// It reads only the local Animator, so in a networked game every machine can run it from what it
     /// shows, with no packets.
     /// </summary>
@@ -29,6 +33,10 @@ namespace PosePicker
         private float _blendStart, _blendDuration;
         private AnimationCurve _blendShape;
 
+        // Layered poses: the one playing (or fading in) and the one fading out under it.
+        private PoseLayer _layer, _leaving;
+        private float _layerStart, _leavingStart, _leavingFrom;
+
         /// <summary>An action's extra turn of the body, around the hips, used by states that follow the aim.</summary>
         public Quaternion Lean { get; set; } = Quaternion.identity;
 
@@ -40,6 +48,52 @@ namespace PosePicker
             _baseLocalPosition = _model.localPosition;
             _baseLocalRotation = _model.localRotation;
             _snapshot = new PoseSnapshot(_animator);
+        }
+
+        /// <summary>The layered pose playing now (null if none, or if it is only fading out).</summary>
+        public PoseAsset Layered => _layer?.Pose;
+
+        /// <summary>
+        /// Puts a layered pose on: its masked bones move into it over its BlendIn along its BlendShape,
+        /// the rest keeps the Animator's. Playing the pose already on does nothing; another one fades out
+        /// over its own BlendOut. A pose without a mask, or before it was saved from the window, is
+        /// refused with a warning (a whole-body pose belongs on an Animator state).
+        /// </summary>
+        public void PlayLayered(PoseAsset pose)
+        {
+            if (pose == null)
+            {
+                StopLayered();
+                return;
+            }
+            if (!isActiveAndEnabled || _layer != null && _layer.Pose == pose)
+                return;
+            if (!pose.IsLayered || pose.Rotations == null || pose.Rotations.Count == 0)
+            {
+                Debug.LogWarning($"ModelPose: '{pose.name}' has no bone mask or was not saved from the Pose Picker; not played.", this);
+                return;
+            }
+            StopLayered();
+            _layer = new PoseLayer(_animator, pose);
+            _layerStart = Time.time;
+        }
+
+        /// <summary>The layered pose fades out over its BlendOut, the bones going back to the Animator's.</summary>
+        public void StopLayered()
+        {
+            if (_layer == null)
+                return;
+            _leavingFrom = LayerWeight();
+            _leaving = _layer;
+            _leavingStart = Time.time;
+            _layer = null;
+        }
+
+        /// <summary>Reads the playing layered pose's mask again, after code changed it.</summary>
+        public void RefreshMask()
+        {
+            _layer?.RefreshMask();
+            _leaving?.RefreshMask();
         }
 
         /// <summary>
@@ -77,6 +131,8 @@ namespace PosePicker
             Lean = Quaternion.identity;
             _state = null;
             _blendDuration = 0f;
+            _layer = null;
+            _leaving = null;
         }
 
         // LateUpdate: after the Animator posed the bones this frame, so the offsets go on top of the clip.
@@ -100,6 +156,26 @@ namespace PosePicker
                 else
                     _snapshot.BlendTo(BlendShapes.Evaluate(_blendShape, t));
             }
+
+            // Layered poses last: on top of the state's pose and its blend, the old one under the new.
+            if (_leaving != null)
+            {
+                float blendOut = _leaving.Pose.BlendOut;
+                float t = blendOut > 0f ? (Time.time - _leavingStart) / blendOut : 1f;
+                if (t >= 1f)
+                    _leaving = null;
+                else
+                    _leaving.Apply(_leavingFrom * BlendShapes.FadeOut(t));
+            }
+            _layer?.Apply(LayerWeight());
+        }
+
+        private float LayerWeight()
+        {
+            if (_layer == null)
+                return 0f;
+            float blendIn = _layer.Pose.BlendIn;
+            return BlendShapes.Evaluate(_layer.Pose.BlendShape, blendIn > 0f ? (Time.time - _layerStart) / blendIn : 1f);
         }
 
         /// <summary>
